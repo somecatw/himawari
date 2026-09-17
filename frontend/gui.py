@@ -26,6 +26,8 @@ import numpy as np
 
 from . import WasapiLoopbackSource, FileAudioSource, FramePitch, PitchFrontend
 from .engine import midi_to_note
+from .symbols import (ESCAPE, ERASURE, CodecSpec, SymbolChannel, SymbolEvent,
+                      band_for)
 from .__main__ import engine_frame_hop, parse_note
 
 # ---- 取自 dataviz skill 参考调色板(深色模式) ----
@@ -99,9 +101,11 @@ class _Spectrum:
 class _Worker(threading.Thread):
     """后台: 音源 -> 引擎 -> 显示队列。"""
 
-    def __init__(self, src, fe, spec, out: queue.Queue, pace: bool):
+    def __init__(self, src, fe, spec, out: queue.Queue, pace: bool,
+                 on_finish=None):
         super().__init__(daemon=True)
         self.src, self.fe, self.spec, self.out, self.pace = src, fe, spec, out, pace
+        self.on_finish = on_finish
         self.stop = threading.Event()
         self.error: str | None = None
 
@@ -125,7 +129,9 @@ class _Worker(threading.Thread):
             self.error = f"{type(e).__name__}: {e}"
         finally:
             try:
-                self.fe.flush()
+                self.fe.flush()      # 排空引擎前瞻; 其中的帧仍会走 on_frame
+                if self.on_finish:
+                    self.on_finish()  # 收尾符号信道的最后一个行程
             except Exception:
                 pass
             self.out.put(("end", self.error))
@@ -136,10 +142,16 @@ class App:
     NBINS = 160
     TRAJ_H = 34
 
-    def __init__(self, root: tk.Tk, src, fe, sr: int, pace: bool, title: str):
+    MAX_STREAM = 72         # 界面上保留的最近符号数
+
+    def __init__(self, root: tk.Tk, src, fe, sr: int, pace: bool, title: str,
+                 codec: CodecSpec):
         self.root = root
         self.q: queue.Queue = queue.Queue(maxsize=256)
         self.spec = _Spectrum(sr, self.NBINS, fmax=4000.0)
+        self.codec = codec
+        self.ch = SymbolChannel(codec, on_symbol=self._on_symbol)
+        self.stream: list[str] = []
 
         root.title(title)
         root.configure(bg=PLANE)
@@ -169,6 +181,31 @@ class App:
                               bg=SURFACE, highlightthickness=0)
         self.traj.pack()
 
+        # ---- 符号流 ----
+        tk.Label(wrap, text=f"符号流 GF({codec.q})  —  "
+                            f"{'  '.join(f'{codec.key_of(i)}={codec.name_of(i)}' for i in range(codec.q))}"
+                            f"  {codec.key_of(ESCAPE)}=ESC",
+                 bg=PLANE, fg=MUTED, font=("Consolas", 9)).pack(anchor="w",
+                                                               pady=(8, 0))
+        sy = tk.Frame(wrap, bg=PLANE)
+        sy.pack(fill="x")
+        self.sym_lbl = tk.Label(sy, text="-", bg=PLANE, fg=INK,
+                                font=("Consolas", 26, "bold"))
+        self.sym_lbl.pack(side="left")
+        self.sym_det = tk.Label(sy, text="", bg=PLANE, fg=INK_2,
+                                font=("Consolas", 10), justify="left")
+        self.sym_det.pack(side="left", padx=12)
+        self.stream_lbl = tk.Label(wrap, text="", bg=SURFACE, fg="#86b6ef",
+                                   font=("Consolas", 10), justify="left",
+                                   anchor="w", wraplength=self.W - 12,
+                                   padx=6, pady=4)
+        self.stream_lbl.pack(fill="x")
+        self.raw_lbl = tk.Label(wrap, text="", bg=SURFACE, fg=MUTED,
+                                font=("Consolas", 9), justify="left",
+                                anchor="w", wraplength=self.W - 12,
+                                padx=6)
+        self.raw_lbl.pack(fill="x")
+
         self.hist: list[float] = []
         self.img_arr = np.zeros((self.NBINS, self.W, 3), dtype=np.uint8)
         self.img_arr[:, :] = LUT[0]
@@ -177,7 +214,8 @@ class App:
         self._render()
 
         # 线程在 start() 里才启动 —— 要等 fe.on_event 接好, 否则开头几帧丢失
-        self.worker = _Worker(src, fe, self.spec, self.q, pace)
+        self.worker = _Worker(src, fe, self.spec, self.q, pace,
+                              on_finish=self.ch.flush)
         self._ended = False
         self._got_end = False
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -201,6 +239,22 @@ class App:
         self.canvas.itemconfig(self._item, image=self._photo)
 
     # ---- 主线程轮询 ----
+    def _render_symbol(self, ev: SymbolEvent) -> None:
+        """只呈现解出的结果。ESC 与擦除是信道内部的事, 不上界面。"""
+        if ev.sym in (ESCAPE, ERASURE):
+            return
+        c = self.codec
+        self.sym_lbl.config(text=str(ev.sym), fg=INK)
+        self.sym_det.config(text=f"{c.name_of(ev.sym)}\n"
+                                 f"键 {c.key_of(ev.sym)}   "
+                                 f"{ev.dur * 1000:.0f} ms", fg=INK_2)
+        self.stream.append(str(ev.sym))
+        del self.stream[:-self.MAX_STREAM]
+        self.stream_lbl.config(text=" ".join(self.stream))
+        m = self.ch.merged
+        self.raw_lbl.config(text=f"符号 {len(self.ch.data)}"
+                                 + (f"   干扰合并 {m}" if m else ""))
+
     def tick(self) -> None:
         dirty = ui = False
         for _ in range(64):
@@ -208,6 +262,9 @@ class App:
                 kind, payload = self.q.get_nowait()
             except queue.Empty:
                 break
+            if kind == "sym":
+                self._render_symbol(payload)
+                continue
             if kind == "col":
                 self.img_arr = np.roll(self.img_arr, -1, axis=1)
                 self.img_arr[:, -1] = LUT[(payload * 255).astype(np.uint8)]
@@ -274,8 +331,13 @@ class App:
             self.traj.create_line(*pts, fill="#86b6ef", width=2,
                                   capstyle="round", joinstyle="round")
 
+    def _on_symbol(self, ev: SymbolEvent) -> None:
+        """符号信道回调(同样在工作线程里): 只投递, 不碰 GUI。"""
+        self.q.put(("sym", ev))
+
     def on_frame(self, fp: FramePitch) -> None:
         """引擎回调(在工作线程里): 只投递数值, 不碰任何 GUI 对象。"""
+        self.ch.on_frame(fp)          # 符号信道与显示共用同一份帧流
         if fp.voiced and fp.midi_smooth is not None:
             self.q.put(("ui", (midi_to_note(fp.midi_smooth), fp.freq,
                                fp.midi_smooth, fp.power_db)))
@@ -303,11 +365,21 @@ def main() -> None:
     ap.add_argument("--device", default=None)
     ap.add_argument("--fast", action="store_true",
                     help="文件不按原速播放(默认按原速, 便于观察)")
-    ap.add_argument("--lo", default="C3")
-    ap.add_argument("--hi", default="B5")
+    ap.add_argument("--lo", default=None,
+                    help="分析带下限音名; 缺省由符号表推出")
+    ap.add_argument("--hi", default=None,
+                    help="分析带上限音名; 缺省由符号表推出")
     ap.add_argument("--hp", type=float, default=100.0)
     ap.add_argument("--f0-method", choices=("yin", "peak"), default="yin")
+    ap.add_argument("--pitches", default="60,62,64,65,67,69,71",
+                    help="7 个数据符号的 MIDI 号(或音名), 逗号分隔")
+    ap.add_argument("--escape", default="72", help="ESC 的 MIDI 号或音名")
     args = ap.parse_args()
+
+    esc = parse_note(args.escape) if args.escape[0].isalpha() else int(args.escape)
+    pitches = tuple(parse_note(p) if p[0].isalpha() else int(p)
+                    for p in args.pitches.split(",") if p.strip())
+    codec = CodecSpec(pitches, esc)
 
     if args.loopback:
         src = WasapiLoopbackSource(device=args.device)
@@ -318,13 +390,19 @@ def main() -> None:
         src = FileAudioSource(args.infile)
         title = f"音高监视 — {args.infile}"
 
+    # 分析带必须与 CLI 用同一套推导, 否则 ESC 音的强谐波会压在带边界上
+    # 被门限掉, 界面上会显示成"无声"(见 symbols.band_for)
+    lo_d, hi_d = band_for(codec)
+    lo = parse_note(args.lo) if args.lo else lo_d
+    hi = parse_note(args.hi) if args.hi else hi_d
     frame, hop = engine_frame_hop(src.sample_rate, 4096, 512)
     fe = PitchFrontend(sr=src.sample_rate, frame=frame, hop=hop,
-                       range_midi=(parse_note(args.lo), parse_note(args.hi)),
+                       range_midi=(lo, hi),
                        f0_method=args.f0_method, hp_hz=args.hp)
 
     root = tk.Tk()
-    app = App(root, src, fe, src.sample_rate, pace=not args.fast, title=title)
+    app = App(root, src, fe, src.sample_rate, pace=not args.fast, title=title,
+              codec=codec)
     fe.on_event = lambda e: (app.on_frame(e)
                              if isinstance(e, FramePitch) else None)
     app.start()
