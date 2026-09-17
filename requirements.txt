@@ -1,0 +1,31 @@
+# 音高识别前端 —— 依赖
+#
+#   uv pip install --python venv/Scripts/python.exe -r requirements.txt
+# 或
+#   pip install -r requirements.txt
+#
+# 实测环境: Python 3.12 / Windows 11, 版本见下方各条。
+
+# --- 核心 ---
+# 引擎(frontend/engine.py)是纯 numpy 的, 只依赖这一项
+numpy>=2.0
+
+# 文件音源(FileAudioSource)与离线脚本读音频
+# mp3 解码依赖其内置的 libsndfile >= 1.1
+soundfile>=0.13
+
+# --- 仅离线脚本 pitch_track.py 需要 ---
+# savgol_filter / median_filter 用于 MIDI 域平滑。
+# frontend/ 引擎刻意不依赖 scipy, 所以只跑实时前端的话可以不装。
+scipy>=1.13
+
+# --- 仅 Windows 回环采集需要 ---
+# PyAudio + PortAudio v19 的 fork, 提供 WASAPI loopback。
+# 只在 frontend/audio.py 的 WasapiLoopbackSource 里延迟导入;
+# 非 Windows 平台装不了, 故加平台标记(开发在 WSL 时不会被误装)。
+# 注意: 采集不注册任何虚拟音频设备, 见该类文档。
+pyaudiowpatch>=0.2.12; sys_platform == "win32"
+
+# 注 1: cffi / pycparser / typing-extensions 由 soundfile 自动带入, 不必显式列。
+# 注 2: tkinter 属标准库, 但部分 Linux 发行版需单独安装
+#       (Debian/Ubuntu: apt install python3-tk)。
