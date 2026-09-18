@@ -118,18 +118,17 @@ class CodecSpec:
         return out
 
 
-def band_for(spec: CodecSpec) -> Tuple[int, int]:
-    """符号表 -> 分析带(最低音下方一个八度, 最高音上方一个八度)。
+def band_for(notes: Sequence[int]) -> Tuple[int, int]:
+    """信道用到的音高集合 -> 分析带(最低音下方一个八度, 最高音上方一个八度)。
 
     上限必须留够, 这不是保守取值而是必需品: 引擎的局部峰检测用 b[1:-1],
     **带的上边界那根 bin 永远不可能被判为峰**, 于是音符的强谐波一旦压在边界上,
-    谐波占比门限的分子就只剩弱基频, 整个音被门限掉。实测 ESC 音 C5 的 2 次谐波
-    恰在 fmax 上时 0/124 帧有声, 放宽一个八度即 23/124。
+    谐波占比门限的分子就只剩弱基频, 整个音被门限掉。实测 C5 的 2 次谐波恰在
+    fmax 上时 0/124 帧有声, 放宽一个八度即 23/124。
 
-    GUI 与 CLI 都必须走这里, 否则显示端会把 ESC 音显示成"无声"。
+    GUI 与 CLI 都必须走这里, 否则信道里的高音会被显示成"无声"。
     """
-    all_p = spec.pitches + (spec.escape,)
-    return min(all_p) - 12, max(all_p) + 12
+    return min(notes) - 12, max(notes) + 12
 
 
 @dataclass
@@ -352,7 +351,7 @@ def main() -> None:
     # 谐波占比门限的分子就只剩弱基频, 该音会被整个门限掉(实测 ESC 音 C5:
     # 2 次谐波恰在 fmax 上时 0/124 帧有声, 放宽一点即 23/124)。
     # 故上限取"符号表最高音再高一个八度", 保证至少两次谐波落在带内。
-    lo_d, hi_d = band_for(spec)
+    lo_d, hi_d = band_for(spec.pitches + (spec.escape,))
     lo_note = parse_note(args.lo) if args.lo else lo_d
     hi_note = parse_note(args.hi) if args.hi else hi_d
 

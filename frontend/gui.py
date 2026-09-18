@@ -26,9 +26,32 @@ import numpy as np
 
 from . import WasapiLoopbackSource, FileAudioSource, FramePitch, PitchFrontend
 from .engine import midi_to_note
-from .symbols import (ESCAPE, ERASURE, CodecSpec, SymbolChannel, SymbolEvent,
-                      band_for)
+from .symbols import band_for
 from .__main__ import engine_frame_hop, parse_note
+
+
+def _channel_imports():
+    """接收端与码表在仓库根目录, 不在 frontend 包内。
+
+    从任意 cwd 都能跑, 所以把仓库根塞进 sys.path; 失败时给人话而不是
+    ImportError 堆栈。
+    """
+    import os
+    import sys
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    try:
+        from receiver import Receiver
+        from huffman_codec import MIDI8
+    except ImportError as e:      # pragma: no cover
+        raise SystemExit(
+            f"找不到 receiver.py / huffman_codec.py(应在 {root})。"
+            f"GUI 的解码依赖它们。") from e
+    return Receiver, MIDI8
+
+
+Receiver, MIDI8 = _channel_imports()
 
 # ---- 取自 dataviz skill 参考调色板(深色模式) ----
 SURFACE = "#1a1a19"      # 图表底色
@@ -142,16 +165,18 @@ class App:
     NBINS = 160
     TRAJ_H = 34
 
-    MAX_STREAM = 72         # 界面上保留的最近符号数
+    MAX_NOTES = 48          # 界面上保留的最近音高数
 
-    def __init__(self, root: tk.Tk, src, fe, sr: int, pace: bool, title: str,
-                 codec: CodecSpec):
+    def __init__(self, root: tk.Tk, src, fe, sr: int, pace: bool, title: str):
         self.root = root
         self.q: queue.Queue = queue.Queue(maxsize=256)
         self.spec = _Spectrum(sr, self.NBINS, fmax=4000.0)
-        self.codec = codec
-        self.ch = SymbolChannel(codec, on_symbol=self._on_symbol)
-        self.stream: list[str] = []
+        # 解码链: NoteEvent -> 旋转层作差 -> 流式七叉哈夫曼 -> 文本
+        self.rx = Receiver()
+        self.rx_log: list[str] = []      # 已完成的报文
+        # 最近一条完成的报文 (text, complete, 音符数, 重复跳, 杂音跳, 音高序列)。
+        # 收进一个元组而不是散成多个 done_* 字段 —— 显示时要整组回退, 散着容易漏。
+        self.done: Optional[tuple] = None
 
         root.title(title)
         root.configure(bg=PLANE)
@@ -181,30 +206,30 @@ class App:
                               bg=SURFACE, highlightthickness=0)
         self.traj.pack()
 
-        # ---- 符号流 ----
-        tk.Label(wrap, text=f"符号流 GF({codec.q})  —  "
-                            f"{'  '.join(f'{codec.key_of(i)}={codec.name_of(i)}' for i in range(codec.q))}"
-                            f"  {codec.key_of(ESCAPE)}=ESC",
-                 bg=PLANE, fg=MUTED, font=("Consolas", 9)).pack(anchor="w",
-                                                               pady=(8, 0))
-        sy = tk.Frame(wrap, bg=PLANE)
-        sy.pack(fill="x")
-        self.sym_lbl = tk.Label(sy, text="-", bg=PLANE, fg=INK,
-                                font=("Consolas", 26, "bold"))
-        self.sym_lbl.pack(side="left")
-        self.sym_det = tk.Label(sy, text="", bg=PLANE, fg=INK_2,
-                                font=("Consolas", 10), justify="left")
-        self.sym_det.pack(side="left", padx=12)
-        self.stream_lbl = tk.Label(wrap, text="", bg=SURFACE, fg="#86b6ef",
-                                   font=("Consolas", 10), justify="left",
-                                   anchor="w", wraplength=self.W - 12,
-                                   padx=6, pady=4)
-        self.stream_lbl.pack(fill="x")
-        self.raw_lbl = tk.Label(wrap, text="", bg=SURFACE, fg=MUTED,
-                                font=("Consolas", 9), justify="left",
+        # ---- 解码结果(旋转层作差 + 流式七叉哈夫曼, 无纠错) ----
+        tk.Label(wrap, text="解码 (旋转信道层 + 七叉哈夫曼, 无纠错)",
+                 bg=PLANE, fg=MUTED, font=("Consolas", 9)).pack(
+                     anchor="w", pady=(8, 0))
+        self.text_lbl = tk.Label(wrap, text="…", bg=SURFACE, fg=INK,
+                                 font=("Microsoft YaHei UI", 15),
+                                 justify="left", anchor="w",
+                                 wraplength=self.W - 12, padx=6, pady=6)
+        self.text_lbl.pack(fill="x")
+        # 名字别叫 note_lbl: 顶部那个大字音高读数已经占了这名字, 重名会把
+        # 它的引用覆盖掉, 顶部就再也不更新了
+        self.seq_lbl = tk.Label(wrap, text="", bg=SURFACE, fg="#86b6ef",
+                                font=("Consolas", 10), justify="left",
                                 anchor="w", wraplength=self.W - 12,
                                 padx=6)
-        self.raw_lbl.pack(fill="x")
+        self.seq_lbl.pack(fill="x")
+        self.rx_lbl = tk.Label(wrap, text="", bg=SURFACE, fg=MUTED,
+                               font=("Consolas", 9), justify="left",
+                               anchor="w", wraplength=self.W - 12, padx=6)
+        self.rx_lbl.pack(fill="x")
+        self.log_lbl = tk.Label(wrap, text="", bg=PLANE, fg=INK_2,
+                                font=("Microsoft YaHei UI", 9), justify="left",
+                                anchor="w", wraplength=self.W - 12)
+        self.log_lbl.pack(fill="x", pady=(2, 0))
 
         self.hist: list[float] = []
         self.img_arr = np.zeros((self.NBINS, self.W, 3), dtype=np.uint8)
@@ -215,7 +240,7 @@ class App:
 
         # 线程在 start() 里才启动 —— 要等 fe.on_event 接好, 否则开头几帧丢失
         self.worker = _Worker(src, fe, self.spec, self.q, pace,
-                              on_finish=self.ch.flush)
+                              on_finish=self._finish)
         self._ended = False
         self._got_end = False
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -239,21 +264,34 @@ class App:
         self.canvas.itemconfig(self._item, image=self._photo)
 
     # ---- 主线程轮询 ----
-    def _render_symbol(self, ev: SymbolEvent) -> None:
-        """只呈现解出的结果。ESC 与擦除是信道内部的事, 不上界面。"""
-        if ev.sym in (ESCAPE, ERASURE):
-            return
-        c = self.codec
-        self.sym_lbl.config(text=str(ev.sym), fg=INK)
-        self.sym_det.config(text=f"{c.name_of(ev.sym)}\n"
-                                 f"键 {c.key_of(ev.sym)}   "
-                                 f"{ev.dur * 1000:.0f} ms", fg=INK_2)
-        self.stream.append(str(ev.sym))
-        del self.stream[:-self.MAX_STREAM]
-        self.stream_lbl.config(text=" ".join(self.stream))
-        m = self.ch.merged
-        self.raw_lbl.config(text=f"符号 {len(self.ch.data)}"
-                                 + (f"   干扰合并 {m}" if m else ""))
+    def _finish(self) -> None:
+        """工作线程收尾(在 worker 里): 把最后的状态投一次, 免得界面上停在中途。"""
+        if self.rx.result.text and self.done is None:
+            self.done = self._snapshot()
+        self._push_rx()
+
+    def _render_rx(self, payload) -> None:
+        cur, done = payload
+        # 一条报文刚解完、下一条还没开始收时, 整组回退到上一条 —— 文本、音高、
+        # **以及跳过计数**都要在, 否则计数器会随着重置消失。
+        text, complete, n, reps, skip, notes = cur or done or ("", False, 0, 0, 0, [])
+        self.text_lbl.config(text=text or "…", fg=INK)
+        # 显示音高而非数字。Receiver.feed 里相邻同音已被跳过(只累加 repeats,
+        # 不收进 notes), 所以这里天然只出现一次, 而跳过计数照常显示。
+        self.seq_lbl.config(text=" ".join(notes[-self.MAX_NOTES:]))
+        bits = [f"音符 {n}"]
+        if reps:
+            bits.append(f"重复跳 {reps}")
+        if skip:
+            bits.append(f"杂音跳 {skip}")
+        if cur is not None:
+            bits.append("已完成" if complete else "接收中")
+        else:
+            bits.insert(0, "上一条")
+        self.rx_lbl.config(text="   ".join(bits))
+        self.log_lbl.config(
+            text=("更早: " + "  |  ".join(self.rx_log[:-1]))
+            if len(self.rx_log) > 1 else "")
 
     def tick(self) -> None:
         dirty = ui = False
@@ -262,8 +300,8 @@ class App:
                 kind, payload = self.q.get_nowait()
             except queue.Empty:
                 break
-            if kind == "sym":
-                self._render_symbol(payload)
+            if kind == "rx":
+                self._render_rx(payload)
                 continue
             if kind == "col":
                 self.img_arr = np.roll(self.img_arr, -1, axis=1)
@@ -331,13 +369,35 @@ class App:
             self.traj.create_line(*pts, fill="#86b6ef", width=2,
                                   capstyle="round", joinstyle="round")
 
-    def _on_symbol(self, ev: SymbolEvent) -> None:
-        """符号信道回调(同样在工作线程里): 只投递, 不碰 GUI。"""
-        self.q.put(("sym", ev))
+    def on_note(self, ev) -> None:
+        """引擎的音符事件(在工作线程里) -> 接收端解码。
+
+        喂的是 **NoteEvent 而非 FramePitch**: 旋转编码下相邻同音必为损伤, 只有
+        按音符(而非逐帧)喂入, "同音"才携带信息; 逐帧喂会把每个稳定音都算成
+        重复。引擎的 _NoteSegmenter 已经做了同音 run 合并。
+        """
+        if self.rx.result.complete:
+            # 上一条报文已收到 EOF: 归档并开新的一条, 支持连续多条消息
+            self.done = self._snapshot()
+            self.rx_log.append(self.done[0])
+            del self.rx_log[:-4]
+            self.rx = Receiver()
+        self.rx.feed(ev)
+        self._push_rx()
+
+    def _snapshot(self) -> tuple:
+        """当前接收端的完整显示状态, 缺一不可(文本/状态/计数/音高序列)。"""
+        r = self.rx.result
+        return (r.text, r.complete, r.n_notes, r.repeats, r.skipped,
+                list(self.rx.notes))
+
+    def _push_rx(self) -> None:
+        s = self._snapshot()
+        # 空报文(刚重置)不算"当前", 交给显示端回退到上一条
+        self.q.put(("rx", (s if s[0] else None, self.done)))
 
     def on_frame(self, fp: FramePitch) -> None:
         """引擎回调(在工作线程里): 只投递数值, 不碰任何 GUI 对象。"""
-        self.ch.on_frame(fp)          # 符号信道与显示共用同一份帧流
         if fp.voiced and fp.midi_smooth is not None:
             self.q.put(("ui", (midi_to_note(fp.midi_smooth), fp.freq,
                                fp.midi_smooth, fp.power_db)))
@@ -371,15 +431,7 @@ def main() -> None:
                     help="分析带上限音名; 缺省由符号表推出")
     ap.add_argument("--hp", type=float, default=100.0)
     ap.add_argument("--f0-method", choices=("yin", "peak"), default="yin")
-    ap.add_argument("--pitches", default="60,62,64,65,67,69,71",
-                    help="7 个数据符号的 MIDI 号(或音名), 逗号分隔")
-    ap.add_argument("--escape", default="72", help="ESC 的 MIDI 号或音名")
     args = ap.parse_args()
-
-    esc = parse_note(args.escape) if args.escape[0].isalpha() else int(args.escape)
-    pitches = tuple(parse_note(p) if p[0].isalpha() else int(p)
-                    for p in args.pitches.split(",") if p.strip())
-    codec = CodecSpec(pitches, esc)
 
     if args.loopback:
         src = WasapiLoopbackSource(device=args.device)
@@ -390,9 +442,9 @@ def main() -> None:
         src = FileAudioSource(args.infile)
         title = f"音高监视 — {args.infile}"
 
-    # 分析带必须与 CLI 用同一套推导, 否则 ESC 音的强谐波会压在带边界上
-    # 被门限掉, 界面上会显示成"无声"(见 symbols.band_for)
-    lo_d, hi_d = band_for(codec)
+    # 分析带按信道音集推导(旋转层用 C4..C5 共 8 个音), 否则高音的强谐波会压在
+    # 带边界盲区上被门限掉, 界面上显示成"无声"(见 symbols.band_for)
+    lo_d, hi_d = band_for(MIDI8)
     lo = parse_note(args.lo) if args.lo else lo_d
     hi = parse_note(args.hi) if args.hi else hi_d
     frame, hop = engine_frame_hop(src.sample_rate, 4096, 512)
@@ -401,10 +453,10 @@ def main() -> None:
                        f0_method=args.f0_method, hp_hz=args.hp)
 
     root = tk.Tk()
-    app = App(root, src, fe, src.sample_rate, pace=not args.fast, title=title,
-              codec=codec)
-    fe.on_event = lambda e: (app.on_frame(e)
-                             if isinstance(e, FramePitch) else None)
+    app = App(root, src, fe, src.sample_rate, pace=not args.fast, title=title)
+    # 帧事件用于显示, 音符事件进解码器 —— 两者分工不同(见 App.on_note)
+    fe.on_event = lambda e: (app.on_frame(e) if isinstance(e, FramePitch)
+                             else app.on_note(e))
     app.start()
     root.mainloop()
     src.close()

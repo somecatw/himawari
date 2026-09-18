@@ -317,7 +317,7 @@ class PitchFrontend:
                  fmin: Optional[float] = None, fmax: Optional[float] = None,
                  range_midi: tuple = (48, 83),
                  median: int = 7, smooth: int = 9,
-                 harm_thr: float = 0.045, harm_tol: float = 0.025,
+                 harm_thr: float = 0.030, harm_tol: float = 0.025,
                  subharm: bool = False, f0_method: str = "yin",
                  yin_threshold: float = 0.15,
                  hp_hz: float = 100.0, hp_stages: int = 1,
@@ -406,12 +406,15 @@ class PitchFrontend:
     def _harm_ratio(self, spec: np.ndarray, b: np.ndarray, f0: float) -> float:
         """能量落在 f0 谐波列上的占比(噪音门限用)。
 
-        注: 该指标对高音结构性不利——音域上端的音符带内只剩 1~2 根谐波线,
-        分母却是整带 ~340 根 bin 的和, 比值必然被稀释。曾试过改成"梳状线
-        相对带内噪声中值的信噪比(dB)"(含 dB 域/功率域平均/取最大值三种),
-        但用真实音符与气声噪声各若干帧实测, 三者都无法分开(min gap 均为负,
-        功率域 -7.3dB): 单帧谱统计区分不了弱音与气声。故保留原指标, 弱音
-        的取舍交由能量门限与后续时域平滑/分段处理。
+        该指标对高音结构性不利: 音域上端的音符带内只剩 1~2 根谐波线, 分母却是
+        整带 ~340 根 bin 的线性和, 比值必然被稀释。实测(实吹录音 t1)环里最高的
+        C5 该指标中位 0.0469, 其他音 0.0637 —— **系统性吃亏 27%**, 正好压在门限上,
+        整个音被砍掉, 表现为"整个音符消失"(差分链断, 一个音毁两个数字)。
+
+        harm_thr 因此从 0.045 降到 0.030: 两段实吹录音从解码出错变为全对, 且
+        静音段不引入任何多余音符。更根本的改法是分母改用噪声底归一(实测可让
+        C5 由其他音的 73% 变为 109%, 偏置消失), 但需要重新标定门限与全量回归,
+        留作后续。
         """
         harm_sum = 0.0
         for k in range(1, 9):
