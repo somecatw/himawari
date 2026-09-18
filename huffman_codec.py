@@ -107,7 +107,7 @@ def _byte_digits(b: int) -> tuple[int, ...]:
     return (b // (K * K), (b // K) % K, b % K)
 
 
-def text_to_digits(text: str) -> list[int]:
+def text_to_digits(text: str, eof: bool = True) -> list[int]:
     digits: list[int] = []
     for ch in text:
         code = CODE_OF.get(ch)
@@ -117,7 +117,8 @@ def text_to_digits(text: str) -> list[int]:
             digits += CODE_OF[ESC]
             for b in ch.encode("utf-8"):
                 digits += _byte_digits(b)
-    digits += CODE_OF[EOF]
+    if eof:
+        digits += CODE_OF[EOF]
     return digits
 
 

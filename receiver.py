@@ -283,6 +283,54 @@ class Receiver:
 
 # --- 模块级便捷函数 -----------------------------------------------------------
 
+def _plausibility(text: str) -> float:
+    """字频似然: 平均哈夫曼码长(越短 = 高频字占比越高 = 越像正常文本)。"""
+    if not text:
+        return float("inf")
+    return sum(len(CODE_OF.get(c, (0,) * _MAX_CODE_LEN))
+               for c in text) / len(text)
+
+
+def decode_assisted(notes, max_candidates: int = 6) -> list[DecodeResult]:
+    """单错误假设枚举 + 字频似然排序(短报文推荐模式)。
+
+    贪心解码完整(收到 EOF = 无损伤)时直接返回单候选快速路径; 缺 EOF
+    说明存在损伤, 枚举单错误假设:
+        吞音:  删除第 i 个音符              (n 个假设)
+        多音:  第 i 位前插入音 v            (n × 8)
+        错音:  第 i 位替换为 v              (n × 7)
+    每个假设独立贪心解码(哈夫曼失步自动再同步, 损伤局部化), 按
+    (收到 EOF, 平均码长升序) 排序, 前 max_candidates 个供人眼终审。"""
+    base = decode_notes(notes)
+    if base.ok:
+        base.repairs = 0
+        return [base]
+
+    seen_notes, variants = set(), []
+    seq = list(notes)
+    for i in range(len(seq)):
+        for v in NOTES8:
+            if v != seq[i]:
+                variants.append(seq[:i] + [v] + seq[i + 1:])   # 错音
+        variants.append(seq[:i] + seq[i + 1:])                  # 吞音
+        for v in NOTES8:
+            variants.append(seq[:i] + [v] + seq[i:])            # 多音
+    for v in NOTES8:
+        variants.append(seq + [v])                               # 尾部多音
+
+    cands: list[DecodeResult] = []
+    seen_text = set()
+    for seq_v in variants[:2048]:        # 组合上限(2 错场景由纠错档覆盖)
+        res = decode_notes(seq_v)
+        if res.error or res.text in seen_text:
+            continue
+        seen_text.add(res.text)
+        res.repairs = 1                  # 单错误假设
+        cands.append(res)
+    cands.sort(key=lambda c: (not c.complete, _plausibility(c.text)))
+    return cands[:max_candidates] if len(cands) > max_candidates else cands
+
+
 def decode_notes(notes) -> DecodeResult:
     """音名/MIDI 序列(或任意音符对象流) -> DecodeResult(一次整段解码)。"""
     return Receiver().feed_all(notes).result
@@ -540,9 +588,13 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
 
     if args.cmd == "decode":
-        res = decode_notes(_read_notes(args))
-        print(res.text)
-        print(f"[{res.summary()}]", file=sys.stderr)
+        cands = decode_assisted(_read_notes(args))
+        for rank, c in enumerate(cands, 1):
+            star = "  <-- 首选" if rank == 1 else ""
+            body = repr(c.text) if c.text else "''"
+            print(f"{rank}. {body}{star} "
+                  f"(complete={c.complete}, 音符 {c.n_notes})", file=sys.stderr)
+        print("首选文本:", cands[0].text if cands else "")
     elif args.cmd == "simulate":
         if args.p_del is not None:
             damages = [(args.p_del,
