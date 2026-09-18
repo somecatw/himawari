@@ -122,7 +122,14 @@ def text_to_digits(text: str, eof: bool = True) -> list[int]:
     return digits
 
 
-def digits_to_text(digits) -> str:
+def digits_to_text(digits, *, strict: bool = True) -> tuple[str, bool]:
+    """哈夫曼批式解码: 数字流 -> (文本, 是否见到 EOF)。
+
+    text_to_digits 的逆运算。strict=True(默认): 截断/损坏/EOF 后多余
+    码元一律抛 ValueError —— 供有完整性上下文的调用方(RS 帧裁剪)使用。
+    strict=False(宽容): 截断返回已解前缀(complete=False), 码流损坏跳过
+    1 个数字再同步 —— 供多候选排序场景使用(候选可能本就是错的, 不值得
+    抛异常)。流式解码用 Receiver 的 _HuffStream(增量 + 永不抛)。"""
     out: list[str] = []
     acc = length = 0
     it = iter(digits)
@@ -130,24 +137,33 @@ def digits_to_text(digits) -> str:
         try:
             d = next(it)
         except StopIteration:
-            raise ValueError("码流截断: 未收到 EOF") from None
+            if strict:
+                raise ValueError("码流截断: 未收到 EOF") from None
+            return "".join(out), False
         acc, length = acc * K + d, length + 1
         ch = _LOOKUP.get((length, acc))
         if ch is None:
             if length >= _MAX_CODE_LEN:
-                raise ValueError(f"码流损坏: 前缀 {acc} 无法匹配任何码字")
+                if strict:
+                    raise ValueError(f"码流损坏: 前缀 {acc} 无法匹配任何码字")
+                return "".join(out), False     # 宽容: 损坏点之后的尾丢给上层
             continue
         if ch == EOF:
             try:
                 next(it)
-                raise ValueError("EOF 之后仍有多余码元")
+                if strict:
+                    raise ValueError("EOF 之后仍有多余码元")
             except StopIteration:
-                return "".join(out)
+                pass
+            return "".join(out), True
         if ch == ESC:
             out.append(_decode_escaped(it))
         else:
             out.append(ch)
         acc = length = 0
+    if strict:
+        raise ValueError("码流截断: 未收到 EOF")
+    return "".join(out), False
 
 
 def _decode_escaped(it) -> str:
