@@ -6,7 +6,8 @@
 1. 信源层: 按字频(25 亿字语料 + 少量合成权重)建七叉哈夫曼, 码字就是
    0..6 数字序列, 高频字符 2~4 个数字(见 huffman_table.py, 收发共用);
    表外字符用 ESCAPE 码字 + UTF-8 字节逐字节(3 数字/字节)转义;
-   消息末尾追加 EOF 码字, 码流自定界。
+   流式协议默认不发 EOF(省符号): 消息结束由演奏停顿定界, 需要码流
+   自定界的场合显式 text_to_digits(text, eof=True)。
 
 2. 信道层: 旋转映射取代 C5 转义。把 8 个音(C4..C5)看成一个环,
    数字 d 编为「上一个音符 + 1 + d (mod 8)」:
@@ -107,7 +108,7 @@ def _byte_digits(b: int) -> tuple[int, ...]:
     return (b // (K * K), (b // K) % K, b % K)
 
 
-def text_to_digits(text: str, eof: bool = True) -> list[int]:
+def text_to_digits(text: str, eof: bool = False) -> list[int]:
     digits: list[int] = []
     for ch in text:
         code = CODE_OF.get(ch)
@@ -123,13 +124,15 @@ def text_to_digits(text: str, eof: bool = True) -> list[int]:
 
 
 def digits_to_text(digits, *, strict: bool = True) -> tuple[str, bool]:
-    """哈夫曼批式解码: 数字流 -> (文本, 是否见到 EOF)。
+    """哈夫曼批式解码: 数字流 -> (文本, 是否完整收尾)。
 
-    text_to_digits 的逆运算。strict=True(默认): 截断/损坏/EOF 后多余
-    码元一律抛 ValueError —— 供有完整性上下文的调用方(RS 帧裁剪)使用。
-    strict=False(宽容): 截断返回已解前缀(complete=False), 码流损坏跳过
-    1 个数字再同步 —— 供多候选排序场景使用(候选可能本就是错的, 不值得
-    抛异常)。流式解码用 Receiver 的 _HuffStream(增量 + 永不抛)。"""
+    text_to_digits 的逆运算。完整收尾 = 见到 EOF 码字, 或码字边界收尾
+    (流式协议无 EOF 的正常结束); 末尾半码 -> (前缀, False)。
+    strict=True(默认): 末尾半码/损坏/EOF 后多余码元一律抛 ValueError
+    —— 供有完整性上下文的调用方(RS 帧裁剪)使用。strict=False(宽容):
+    半码截断返回已解前缀(complete=False), 码流损坏跳过 1 个数字再同步
+    —— 供多候选排序场景使用(候选可能本就是错的, 不值得抛异常)。
+    流式解码用 Receiver 的 _HuffStream(增量 + 永不抛)。"""
     out: list[str] = []
     acc = length = 0
     it = iter(digits)
@@ -137,9 +140,9 @@ def digits_to_text(digits, *, strict: bool = True) -> tuple[str, bool]:
         try:
             d = next(it)
         except StopIteration:
-            if strict:
-                raise ValueError("码流截断: 未收到 EOF") from None
-            return "".join(out), False
+            if strict and length:
+                raise ValueError("码流截断: 末尾半码") from None
+            return "".join(out), not length
         acc, length = acc * K + d, length + 1
         ch = _LOOKUP.get((length, acc))
         if ch is None:
@@ -161,9 +164,6 @@ def digits_to_text(digits, *, strict: bool = True) -> tuple[str, bool]:
         else:
             out.append(ch)
         acc = length = 0
-    if strict:
-        raise ValueError("码流截断: 未收到 EOF")
-    return "".join(out), False
 
 
 def _decode_escaped(it) -> str:
@@ -197,8 +197,8 @@ def text_to_midi(text: str) -> list[int]:
 
 
 def notes_to_text(notes) -> str:
-    """音名序列 -> 文本。"""
-    return digits_to_text(notes_to_digits(notes))
+    """音名序列 -> 文本(流式协议无 EOF, 边界收尾即正常结束)。"""
+    return digits_to_text(notes_to_digits(notes))[0]
 
 
 # --- 命令行 -------------------------------------------------------------------
@@ -300,8 +300,8 @@ def _selftest() -> int:
         except ValueError:
             pass
     try:
-        digits_to_text([0, 0])                 # 无 EOF
-        raise SystemExit("截断码流未被拒绝")
+        digits_to_text([0])                    # 末尾半码(边界收尾是合法的)
+        raise SystemExit("半码截断码流未被拒绝")
     except ValueError:
         pass
 

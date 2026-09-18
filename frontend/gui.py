@@ -62,6 +62,10 @@ MUTED = "#898781"        # 轴/次要标签
 GRID = "#2c2c2a"         # 网格发丝线
 AXIS = "#383835"         # 基线
 
+# 消息分界的停顿时长(秒): 流式协议不发 EOF, 演奏停顿即报文边界 —— 与
+# rs 停顿分帧同一约定。演奏中音符间隔通常 < 0.5s, 0.8s 停顿视为换气/换报文。
+_ARCHIVE_PAUSE_S = 0.8
+
 # sequential 蓝 700 -> 100(light->dark 的反向: 深色底上亮 = 能量大)
 _RAMP = ["#0d366b", "#104281", "#184f95", "#1c5cab", "#256abf", "#2a78d6",
          "#3987e5", "#5598e7", "#6da7ec", "#86b6ef", "#9ec5f4", "#b7d3f6",
@@ -177,6 +181,7 @@ class App:
         # 最近一条完成的报文 (text, complete, 音符数, 重复跳, 杂音跳, 音高序列)。
         # 收进一个元组而不是散成多个 done_* 字段 —— 显示时要整组回退, 散着容易漏。
         self.done: Optional[tuple] = None
+        self._last_note_t: Optional[float] = None   # 当前报文最近一个音符的时刻
 
         root.title(title)
         root.configure(bg=PLANE)
@@ -376,12 +381,17 @@ class App:
         按音符(而非逐帧)喂入, "同音"才携带信息; 逐帧喂会把每个稳定音都算成
         重复。引擎的 _NoteSegmenter 已经做了同音 run 合并。
         """
-        if self.rx.result.complete:
-            # 上一条报文已收到 EOF: 归档并开新的一条, 支持连续多条消息
+        if (ev.kind == "on" and self.rx.notes and self.rx.result.complete
+                and self._last_note_t is not None
+                and ev.t - self._last_note_t >= _ARCHIVE_PAUSE_S):
+            # 流式协议无 EOF: 上一条已停在码字边界且停顿够长 -> 归档并开
+            # 新的一条, 支持连续多条消息
             self.done = self._snapshot()
             self.rx_log.append(self.done[0])
             del self.rx_log[:-4]
             self.rx = Receiver()
+        if ev.kind == "on":
+            self._last_note_t = ev.t
         self.rx.feed(ev)
         self._push_rx()
 

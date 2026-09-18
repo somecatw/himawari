@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """GF(7) RS 纠错 + 停顿分帧 —— 发送端信道层最外级。
 
-三种模式(接收端三路并行解码, 无报头, 哈夫曼 EOF 终止):
+三种模式(接收端三路并行解码, 无报头, 流式无 EOF):
     no      huffman_codec 链路原样: mod-8 旋转, 无分帧          1.00 音符/数字
     medium  帧 = RS(7,5): 5 数据 + 2 校验, 停顿分帧             ~1.14 + 停顿时间
     high    帧 = RS(7,4): 4 数据 + 3 校验, 停顿分帧             ~1.14
@@ -17,7 +17,7 @@ C5(转义, 纯声学防粘, 不含语义), 帧与帧之间由演奏者停顿分�
 
 接收端解析(帧级 beam, 帧间零耦合): 每段停顿间数字独立修复, 计数 ≠ 7 时
 枚举有界假设(吞音 -> 擦除位; 多音 -> 丢弃); 跨段组合有界截断; 多解释由
-消息级(哈夫曼 EOF + 似然 + 人眼)终审。
+消息级(码边界完整性 + 似然 + 人眼)终审。
 
 命令行:
     python rs_codec.py encode "你好" [--level no|medium|high] [--midi]
@@ -171,7 +171,10 @@ def rs_decode_block(received, k):
 # --- 编码 --------------------------------------------------------------------
 
 def encode_framed(digits, k):
-    """GF(7) 数字流 -> 分帧音符流: 每帧 7 音符(恒等映射, 重复垫 C5) + 停顿。"""
+    """GF(7) 数字流 -> 分帧音符流: 每帧 7 音符(恒等映射, 重复垫 C5) + 停顿。
+
+    尾帧不足 k 位零填充。流式协议无 EOF, 填充零会漏进哈夫曼流 —— 由
+    接收端"剥离尾部垫零"候选消除(见 _padless_variants)。"""
     pad = (-len(digits)) % k
     payload = list(digits) + [0] * pad
     notes, prev = [], None
@@ -210,7 +213,7 @@ def _close_frames(cur, k, repairs):
 
     计数 =7: BW t=1, 失败则 1~2 擦除位穷举; 计数 <7: 吞音, 插入擦除位
     假设(位置穷举); 计数 8/9: 多吹, 丢弃假设。注意 u = 预算(t=0)时错误
-    位置的插值也可能一致 -> 多候选, 由消息级(EOF + 似然 + 人眼)终审。"""
+    位置的插值也可能一致 -> 多候选, 由消息级(完整性 + 似然 + 人眼)终审。"""
     n = len(cur)
     out = []
     if n == 7:
@@ -281,7 +284,7 @@ def _framed_digits(notes, k, max_variants=96):
     每段停顿间数字独立修复, 计数 ≠ 7 时枚举有界假设:
         6/5 音: 吞音 -> 插入擦除位(位置穷举)
         8/9 音: 多吹 -> 丢弃假设
-    跨段组合有界截断; 多解释由消息级(EOF + 似然 + 人眼)终审。"""
+    跨段组合有界截断; 多解释由消息级(完整性 + 似然 + 人眼)终审。"""
     beams = [((), 0)]                        # (已关帧序列, 修复数)
     buf = []
 
@@ -322,10 +325,24 @@ def _framed_digits(notes, k, max_variants=96):
 def _huff_partial(digits):
     """哈夫曼批式解码(宽容): 委托 huffman_codec.digits_to_text。
 
-    截断 -> (已解前缀, complete=False); 码流损坏 -> (已解前缀, False)。
-    完整性信号(complete)仅作排序参考 —— 无 EOF 的流式协议下 RS 候选
-    天然 complete=False。"""
+    半码截断 -> (已解前缀, complete=False); 码流损坏 -> (已解前缀, False)。
+    完整性信号(complete)仅作排序参考 —— 流式协议无 EOF, complete 指
+    码字边界收尾。"""
     return digits_to_text(digits, strict=False)
+
+
+def _padless_variants(digits):
+    """尾帧垫零剥离候选: 原流 + 剥掉尾部全零后缀(1..K-1 位)的各前缀。
+
+    无 EOF 协议下发送端尾帧的零填充会漏进哈夫曼流解出伪字尾; 剥掉
+    p = 垫位数时恰得原文, 其余 p 产生"截尾"伪候选 —— 与真候选并存,
+    由 (完整性, 似然) 排序 + 人眼终审。"""
+    out = [tuple(digits)]
+    for p in range(1, min(len(digits), K - 1) + 1):
+        if digits[-p] != 0:
+            break
+        out.append(tuple(digits[:-p]))
+    return out
 
 
 def _score(text):
@@ -359,11 +376,15 @@ def decode_notes(notes, levels=("no", "medium", "high")):
             cands.sort(key=lambda c: (c.error != "", c.score))
             continue
         for digits, vr in variants:
-            try:
-                text, complete = _huff_partial(digits)
-            except (RSError, ValueError) as e:
-                continue                     # 损坏变体: 跳过(其余变体仍可用)
-            cands.append(Candidate(level, text, complete, vr, _score(text)))
+            streams = ((digits,) if level == "no"      # no 档无填充, 不剥离
+                       else _padless_variants(digits))
+            for dd in streams:
+                try:
+                    text, complete = _huff_partial(dd)
+                except (RSError, ValueError) as e:
+                    continue                 # 损坏变体: 跳过(其余变体仍可用)
+                cands.append(Candidate(level, text, complete, vr,
+                                       _score(text)))
     cands.sort(key=lambda c: (c.error != "", not (c.complete and c.text != ""),
                               c.score, c.repairs))
     return cands
@@ -462,7 +483,7 @@ def _simulate(args):
 
 def _selftest() -> int:
     rng = random.Random(20260917)
-    texts = ["", "a", "ok", "在吗？", "你好，世界！",
+    texts = ["a", "ok", "在吗？", "你好，世界！",   # 无空串: 空报文无帧, 无边界可言
              "今晚八点老地方见，别迟到！",
              "emoji 🎙️ 与生僻字 龘; ascii ~!@#",
              "".join(chr(c) for c in range(0x20, 0x7F))]

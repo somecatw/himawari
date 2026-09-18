@@ -18,8 +18,10 @@ NoteEvent 流) -> [本模块] -> 文本。
     - 旋转信道层作差还原数字: d = (idx - prev - 1) mod 8, 起始 prev = C4
       (序号 0), 与 huffman_codec 的发送端编码互逆。删除/替换各只损坏
       1~2 个数字, 环外杂音可在作差前直接滤除;
-    - EOF 码字终止消息; 流在 EOF 之前结束 -> 结果标记 incomplete,
-      已解出的前缀照常返回, 不报错。
+    - 流式协议默认不发 EOF(省符号): complete 标记 = 码字边界收尾
+      (半码残留 -> incomplete, 已解出的前缀照常返回, 不报错), 消息分界
+      由调用方按演奏停顿判定; EOF 符号仍在码表, 见到即恒定完整(遗留兼
+      容), 其后音符计为余音。
 
 与其它模块的关系: 只依赖收发共用的 huffman_codec(码表 + 旋转层约定),
 不依赖 rs_codec(并行开发中)也不 import frontend —— NoteEvent 等含
@@ -87,26 +89,26 @@ def note_index_of(note) -> Optional[int]:
 class DecodeResult:
     """一次解码的完整结果(文本 + 完成状态 + 信道损伤计数)。"""
 
-    text: str = ""          # 解出的文本(缺 EOF 时为已解出的前缀)
-    complete: bool = False  # 是否收到 EOF 码字(消息完整)
+    text: str = ""          # 解出的文本(半码截断时为已解出的前缀)
+    complete: bool = False  # 消息完整结束: 码字边界收尾, 或见过遗留 EOF
     n_notes: int = 0        # 接受的音符数(= 还原的数字数)
     skipped: int = 0        # 跳过的杂音(不认识的音名/表外 MIDI)
     repeats: int = 0        # 跳过的相邻同音(旋转编码下必为损伤)
-    trailing: int = 0       # EOF 之后的余音
+    trailing: int = 0       # 遗留 EOF 之后的余音
     bad_digits: int = 0     # 哈夫曼失步时丢弃的数字
     error: str = ""         # 非致命解码异常(如转义字节非法), 空串 = 无
 
     @property
     def ok(self) -> bool:
-        """干净成功: 收到 EOF 且无解码异常。"""
+        """干净成功: 边界收尾且无解码异常。"""
         return self.complete and not self.error
 
     def summary(self) -> str:
         """一行状态摘要(诊断用)。"""
-        state = "complete(已收到 EOF)" if self.complete else "incomplete(缺 EOF)"
+        state = "complete(边界收尾)" if self.complete else "incomplete(半码截断)"
         extra = f", error={self.error!r}" if self.error else ""
         return (f"{state}, 音符 {self.n_notes}, 杂音跳过 {self.skipped}, "
-                f"重复音跳过 {self.repeats}, EOF 后余音 {self.trailing}, "
+                f"重复音跳过 {self.repeats}, 余音 {self.trailing}, "
                 f"失步丢弃数字 {self.bad_digits}{extra}")
 
 
@@ -119,7 +121,7 @@ class _HuffStream:
     """流式 7 叉哈夫曼前缀解码(贪心 + 自动再同步, 永不抛异常)。
 
     - 逐数字喂入; 从当前同步点匹配最短码字, 命中即输出字符
-      (EOF -> complete; ESC -> 进入转义态);
+      (EOF(遗留) -> 恒定完整; ESC -> 进入转义态);
     - 转义态: 3 数字/字节, 首字节定长(1~4 字节), 整段按 UTF-8 解码;
       字节越界/序列非法时输出 U+FFFD 并记录 error, 不中断后续解码;
     - 从当前同步点起连续 _MAX_CODE_LEN 个数字匹配不上任何码字(损伤所致):
@@ -129,8 +131,10 @@ class _HuffStream:
 
     def __init__(self) -> None:
         self.chars: list[str] = []
-        self.complete = False            # 已收到 EOF
+        self.complete = False            # 边界收尾(或遗留 EOF, 恒定完整)
         self.error = ""
+        self._eof = False                # 见过遗留 EOF 码字(锁存)
+        self._fed = False                # 已喂过数字(空流不算边界收尾)
         self.bad_digits = 0              # 再同步时丢弃的数字
         self._pend: deque[int] = deque() # 未消费数字窗口(<= 码长上限)
         self._esc: Optional[list[int]] = None  # None=普通态; 否则已收转义字节
@@ -140,8 +144,11 @@ class _HuffStream:
 
     def feed(self, d: int) -> None:
         """喂入一个 GF(7) 数字(0..6)。"""
+        self._fed = True
         self._pend.append(d)
         self._run()
+        if not self._eof:                # 流式完整判据: 无半码残留/转义中断
+            self.complete = (not self._pend and self._esc is None)
 
     def _run(self) -> None:
         while self._pend and not self.complete:
@@ -159,6 +166,7 @@ class _HuffStream:
             for _ in range(used):
                 self._pend.popleft()
             if ch == EOF:
+                self._eof = True
                 self.complete = True
             elif ch == ESC:
                 self._esc, self._b, self._nd = [], 0, 0
@@ -232,7 +240,7 @@ class Receiver:
         self.digits: list[int] = []      # 还原的数字流(可与 RS 层对接)
         self.skipped = 0                 # 不认识的输入(杂音/表外音高)
         self.repeats = 0                 # 相邻同音(旋转编码下必为损伤)
-        self.trailing = 0                # EOF 之后的余音
+        self.trailing = 0                # 遗留 EOF 之后的余音
         self._stream = _HuffStream()
 
     def feed(self, note) -> "Receiver":
@@ -248,8 +256,8 @@ class Receiver:
         if idx is None:
             self.skipped += 1            # 环外杂音: 作差前直接滤除
             return self
-        if self._stream.complete:
-            self.trailing += 1           # EOF 之后的余音
+        if self._stream._eof:
+            self.trailing += 1           # 遗留 EOF 之后的余音: 计数不进解码
             return self
         if idx == self.prev:
             # 发送端旋转编码保证相邻不同音; 相邻同音只可能是检测损伤
@@ -273,7 +281,7 @@ class Receiver:
 
     @property
     def result(self) -> DecodeResult:
-        """当前解码结果(EOF 前随时可读, 文本为已解出的前缀)。"""
+        """当前解码结果(流中随时可读, 文本为已解出的前缀)。"""
         s = self._stream
         return DecodeResult(text="".join(s.chars), complete=s.complete,
                             n_notes=len(self.notes), skipped=self.skipped,
@@ -294,15 +302,15 @@ def _plausibility(text: str) -> float:
 def decode_assisted(notes, max_candidates: int = 6) -> list[DecodeResult]:
     """单错误假设枚举 + 字频似然排序(短报文推荐模式)。
 
-    贪心解码完整(收到 EOF = 无损伤)时直接返回单候选快速路径; 缺 EOF
-    说明存在损伤, 枚举单错误假设:
+    贪心解码干净(边界收尾且无杂音/失步痕迹)时直接返回单候选快速路径;
+    否则枚举单错误假设:
         吞音:  删除第 i 个音符              (n 个假设)
         多音:  第 i 位前插入音 v            (n × 8)
         错音:  第 i 位替换为 v              (n × 7)
     每个假设独立贪心解码(哈夫曼失步自动再同步, 损伤局部化), 按
-    (收到 EOF, 平均码长升序) 排序, 前 max_candidates 个供人眼终审。"""
+    (完整收尾, 平均码长升序) 排序, 前 max_candidates 个供人眼终审。"""
     base = decode_notes(notes)
-    if base.ok:
+    if base.ok and not base.skipped and not base.bad_digits:
         base.repairs = 0
         return [base]
 
@@ -342,14 +350,13 @@ def decode_events(events) -> DecodeResult:
 
 
 def notes_to_text(notes) -> str:
-    """音名/MIDI 序列 -> 文本(贪心; 缺 EOF 时返回已解出的前缀, 不报错)。"""
+    """音名/MIDI 序列 -> 文本(贪心; 半码截断时返回已解出的前缀, 不报错)。"""
     return decode_notes(notes).text
 
 
 # --- 损伤扫描(量化退化数据) ---------------------------------------------------
 
-_SCAN_SAMPLES = [
-    "",
+_SCAN_SAMPLES = [                         # 无空串: 空报文无边界收尾可言
     "在吗？",
     "ok",
     "你好，世界！",
@@ -374,12 +381,12 @@ class ScanRow:
     p_del: float
     p_ins: float
     p_sub: float
-    strict: float    # 严格成功: 文本与原文一致且收到 EOF(首选即原文)
+    strict: float    # 严格成功: 文本与原文一致且完整收尾(首选即原文)
     partial: float   # 部分成功: 非严格, 但解码在首个损伤点之前正确
                      #   (与原文有非空公共前缀; 单候选贪心解码下「原文是
-                     #    候选之一」即退化为这条, 含只丢 EOF 尾的轻微情形)
+                     #    候选之一」即退化为这条, 含只丢尾码的轻微情形)
     fail: float      # 失败: 首字符即错(损伤落在消息开头, 无先验可救)
-    complete: float  # 收到 EOF 的比例
+    complete: float  # 完整收尾(码字边界)的比例
     prefix: float    # 平均公共前缀长度 / 原文长度
 
 
@@ -456,8 +463,8 @@ def format_scan(rows: Sequence[ScanRow]) -> str:
     """扫描结果 -> 比例表(可直接打印)。"""
     head = (f"{'吞音':>6} {'多音':>6} {'弹错':>6} | "
             f"{'严格成功':>8} {'部分成功':>8} {'失败':>7} | "
-            f"{'收到EOF':>7} {'平均前缀比':>8}")
-    lines = ["无纠错贪心解码退化扫描 (严格=文本一致且收到 EOF;"
+            f"{'完整收尾':>7} {'平均前缀比':>8}")
+    lines = ["无纠错贪心解码退化扫描 (严格=文本一致且完整收尾;"
              " 部分=首个损伤点前正确; 失败=首字符即错)"]
     lines.append(head)
     lines.append("-" * len(head))
@@ -502,30 +509,35 @@ def _selftest() -> int:
         for a, b in zip(notes, notes[1:]):           # 发送端约束: 无相邻同音
             assert a != b, f"发送端违反相邻不同音: {text!r}"
         res = decode_notes(notes)
-        assert res.text == text and res.complete, f"音名往返不一致: {text!r}"
+        assert res.text == text, f"音名往返不一致: {text!r}"
+        assert res.complete or not text, f"非空流应边界收尾: {text!r}"
         res = decode_notes(text_to_midi(text))
-        assert res.text == text and res.complete, f"MIDI 往返不一致: {text!r}"
+        assert res.text == text, f"MIDI 往返不一致: {text!r}"
+        assert res.complete or not text
         res = decode_notes([str(m) for m in text_to_midi(text)])  # 数字字符串
-        assert res.text == text and res.complete, f"数字串往返不一致: {text!r}"
+        assert res.text == text, f"数字串往返不一致: {text!r}"
+        assert res.complete or not text
         evs: list[_Ev] = []
         for n in notes:
             evs.append(_Ev("on", MIDI8[NOTES8.index(n)], n))
             evs.append(_Ev("off", MIDI8[NOTES8.index(n)], n))  # off 须被忽略
         res = decode_events(evs)
-        assert res.text == text and res.complete, f"事件往返不一致: {text!r}"
+        assert res.text == text, f"事件往返不一致: {text!r}"
+        assert res.complete or not text
     n_round = len(cases)
 
     # --- 2. 边界与鲁棒性 ---
     text = "你好，世界！"
     notes = text_to_notes(text)
 
-    r = Receiver()                       # 空流: 未收到 EOF -> incomplete
+    r = Receiver()                       # 空流: 未收任何数字 -> incomplete
     assert r.result.text == "" and not r.result.complete
 
-    res = decode_notes(notes[:-2])       # 截断: 缺 EOF, 前缀照常返回
+    res = decode_notes(notes[:-2])       # 截断: 半码收尾, 前缀照常返回
     assert not res.complete and text.startswith(res.text)
 
-    res = decode_notes(notes + ["C4"])   # EOF 后余音: 计数, 不影响文本
+    notes_eof = digits_to_notes(text_to_digits(text, eof=True))
+    res = decode_notes(notes_eof + ["C4"])   # 遗留 EOF 后余音: 计数不影响文本
     assert res.complete and res.text == text and res.trailing == 1
 
     for junk in ("C#4", "G3", "A7", "99"):    # 环外杂音: 滤除, 解码不受影响
@@ -535,13 +547,14 @@ def _selftest() -> int:
     res = decode_notes(notes[:3] + [notes[2]] + notes[3:])   # 相邻重复音(多检)
     assert res.text == text and res.complete and res.repeats == 1
 
-    # 杂音 + 重复音 + EOF 后余音混合
-    res = decode_notes(["X9", notes[0], notes[0], "C#8"] + notes[1:] + ["D4"])
+    # 杂音 + 重复音 + 遗留 EOF 后余音混合
+    res = decode_notes(["X9", notes_eof[0], notes_eof[0], "C#8"]
+                       + notes_eof[1:] + ["D4"])
     assert res.text == text and res.complete
     assert res.skipped == 2 and res.repeats == 1 and res.trailing == 1
 
     # 转义字节损坏: 输出 U+FFFD 并记录 error, 不崩溃, 后续 EOF 照常生效
-    body = text_to_digits("ok")[:-len(CODE_OF[EOF])]   # 剥掉末尾 EOF 码字
+    body = text_to_digits("ok", eof=True)[:-len(CODE_OF[EOF])]  # 剥掉末尾 EOF
     bad = (body + list(CODE_OF[ESC])
            + list(_byte_digits(0x80)) + list(_byte_digits(0x80))
            + list(CODE_OF[EOF]))
