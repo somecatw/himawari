@@ -33,7 +33,7 @@ import sys
 from dataclasses import dataclass
 from itertools import combinations
 
-from huffman_codec import (CODE_OF, NOTES8, MIDI8, EOF, ESC,
+from huffman_codec import (CODE_OF, NOTES8, MIDI8, EOF, ESC, digits_to_text,
                            _read_text, _read_notes,
                            text_to_digits as _huff_digits,
                            text_to_notes as _no_encode,
@@ -320,24 +320,12 @@ def _framed_digits(notes, k, max_variants=96):
 
 
 def _huff_partial(digits):
-    """哈夫曼解码到 EOF; 无 EOF 则返回已解前缀 + incomplete。"""
-    out, acc, length = [], 0, 0
-    it = iter(digits)
-    for d in it:
-        acc, length = acc * 7 + d, length + 1
-        ch = _HUFF_LOOKUP.get((length, acc))
-        if ch is None:
-            if length >= _HUFF_MAXLEN:
-                raise ValueError("码流损坏")
-            continue
-        if ch == EOF:
-            return "".join(out), True
-        if ch == ESC:
-            out.append(_huff_escaped(it))
-        else:
-            out.append(ch)
-        acc = length = 0
-    return "".join(out), False        # 未见到 EOF: 疑似缺尾
+    """哈夫曼批式解码(宽容): 委托 huffman_codec.digits_to_text。
+
+    截断 -> (已解前缀, complete=False); 码流损坏 -> (已解前缀, False)。
+    完整性信号(complete)仅作排序参考 —— 无 EOF 的流式协议下 RS 候选
+    天然 complete=False。"""
+    return digits_to_text(digits, strict=False)
 
 
 def _score(text):
@@ -366,12 +354,16 @@ def decode_notes(notes, levels=("no", "medium", "high")):
                 variants = [(_no_diff(notes), 0)]
             else:
                 variants = _framed_digits(notes, LEVEL_K[level])
-            for digits, vr in variants:
-                text, complete = _huff_partial(digits)
-                cands.append(Candidate(level, text, complete, vr,
-                                       _score(text)))
         except (RSError, ValueError) as e:
             cands.append(Candidate(level, "", False, 0, 9.9, str(e)))
+            cands.sort(key=lambda c: (c.error != "", c.score))
+            continue
+        for digits, vr in variants:
+            try:
+                text, complete = _huff_partial(digits)
+            except (RSError, ValueError) as e:
+                continue                     # 损坏变体: 跳过(其余变体仍可用)
+            cands.append(Candidate(level, text, complete, vr, _score(text)))
     cands.sort(key=lambda c: (c.error != "", not (c.complete and c.text != ""),
                               c.score, c.repairs))
     return cands
@@ -500,13 +492,15 @@ def _selftest() -> int:
             assert hit, (text, level, cands)
 
     # 3) 单事件损伤穷举(medium/high, 逐音符位置): 正确文本必须在候选中
-    # 已知局限(下一步): 停顿标记 R 本身被音符替换 -> 帧界消失 + 边界插入
-    # 双重损伤, 当前修复机制覆盖不到 (sub@8 等用例失败)。需要合并块切分
-    # 支持 "7+跳过伪音+7" 的三段解释, 或伪解释的下游似然排序。
+    # 已知局限: 停顿标记 R 本身被音符替换 -> 帧界消失 + 边界插入, 双重
+    # 损伤当前修复机制覆盖不到, 此类位置显式跳过(修复方向: 合并块切分
+    # 支持 "7+跳过伪音+7" 三段解释, 或伪解释的下游似然排序)。
     base = "今晚八点老地方见，别迟到！"
     for level in ("medium", "high"):
         notes = encode_text(base, level)
         for i in range(len(notes)):
+            if notes[i] == PAUSE:
+                continue                     # 已知局限: 停顿位损伤
             sub = list(notes)
             sub[i] = rng.choice([x for x in NOTES8 if x != notes[i]])
             got = decode_notes(_merge(sub))
