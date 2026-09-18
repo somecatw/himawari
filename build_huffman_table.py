@@ -30,8 +30,7 @@ from fractions import Fraction
 K = 7                                        # 信道数字字母表: 0..6
 ESC_CHAR, EOF_CHAR = "\ue000", "\ue001"      # 控制符号占位(私用区)
 
-DEFAULT_CSV = ("Chinese-character-list-from-2.5-billion-words-corpus-"
-               "ordered-by-frequency.csv")
+DEFAULT_CSV = "data/char-freq-2.5B.csv"
 
 # --- 合成权重(语料缺失的真实消息常用符号; 依据典型聊天文本的相对频率估计) ---
 SYNTHETIC = [

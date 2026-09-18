@@ -216,8 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-Chinese-character-list-*.csv
+data/*.csv
 
+# ts_zip 本地测试(171MB 模型, 不入库)
+recordings/*.mp3
 # ts_zip 本地测试(171MB 模型, 不入库)
 ts_zip-2024-03-02/
 

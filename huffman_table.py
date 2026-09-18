@@ -1,7 +1,7 @@
 """七叉哈夫曼规范码表 —— 收发共用(单一事实来源)。
 
 由 build_huffman_table.py 从字频数据生成, 勿手改:
-    字频: Chinese-character-list-from-2.5-billion-words-corpus-ordered-by-frequency.csv (25 亿字语料, 14976 个简体字, 纯汉字)
+    字频: data/char-freq-2.5B.csv (25 亿字语料, 14976 个简体字, 纯汉字)
     另含少量合成权重的常用符号(空格/换行/字母/数字/标点, 见生成脚本
     SYNTHETIC 块)与两个控制符号: "\ue000"=ESCAPE, "\ue001"=EOF。
 

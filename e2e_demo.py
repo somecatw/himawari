@@ -3,7 +3,7 @@
 
 用法:
     python3 e2e_demo.py [音频文件] [期望明文]
-缺省: t1_no_01..mp3, 期望 '有人堵桥' (无纠错档实录)。
+缺省: recordings/t1_no.mp3, 期望 '有人堵桥' (无纠错档实录)。
 """
 import sys
 
@@ -33,7 +33,7 @@ def decode_file(path: str):
 
 
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else "t1_no_01..mp3"
+    path = sys.argv[1] if len(sys.argv) > 1 else "recordings/t1_no.mp3"
     expect = sys.argv[2] if len(sys.argv) > 2 else "有人堵桥"
     notes, res = decode_file(path)
     print(f"检测到 {len(notes)} 个音符:", " ".join(notes))

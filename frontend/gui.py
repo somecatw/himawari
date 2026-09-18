@@ -1,9 +1,9 @@
 """实时监视 GUI: 频谱瀑布 + 当前音高。
 
 用途是**肉眼验证跟踪对不对**: 瀑布图上能直接看到谐波列, 一眼看出程序锁的是
-基频还是某个谐波(这正是 test2.mp3 当初识别错的原因)。
+基频还是某个谐波(这正是 recordings/test2.mp3 当初识别错的原因)。
 
-    python -m frontend.gui test2.mp3 --hi C6      # 文件按原速播放
+    python -m frontend.gui recordings/test2.mp3 --hi C6      # 文件按原速播放
     python -m frontend.gui --loopback --hi C6     # 采集系统声音
 
 实现要点:
