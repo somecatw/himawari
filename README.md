@@ -91,9 +91,9 @@ python3 huffman_codec.py stats
 ## 状态与下一步
 
 - [x] baseline 编码器 (notes_codec.py)
-- [x] 七叉哈夫曼 + 旋转信道层 (huffman_codec.py)
-- [ ] **接收端同步**: `frontend/symbols.py` 仍是 C5=ESC 方案, 需改为作差解码
-      `d = (note - prev - 1) mod 8` + 共用码表, 两端才能互通
-- [ ] order-1 自适应算术编码(无模型分发成本, 预期再省 15~30%)
-- [ ] RS 纠错(symbols.py 已按 GF(7) 预留)
-- [ ] LLM 压缩仅作长文本模式的可选增强(见实验 3 的实用性结论)
+- [x] 七叉哈夫曼 + 旋转信道层 (huffman_codec.py), 流式协议默认不发 EOF
+- [x] 接收端: 流式贪心解码 + 单错误枚举 (receiver.py), GUI (frontend/gui.py)
+- [x] RS 纠错三档 no/medium/high + 停顿分帧 (rs_codec.py)
+- [x] LM 信源编码可行性实验: token 级逐位置建树 1.87 数字/字 (-45%), 见 `exp_minimind/`
+- [ ] **LM 长文本档产品化**: 任务分解与招募见 [PLAN.md](PLAN.md)
+- [ ] order-1 静态表蒸馏(用 SFT 后模型导出 P(c|h), 零运行时依赖的中间档)
